@@ -24,6 +24,14 @@
 # Please visit the project's homepage at http://ircpush.dont-panic.cc/ for
 # further information.
 #
+#
+# commands:
+# ---------
+#
+# /ircpush_clear:
+#   will send a "clear" message to the ircpush server that is intended to
+#   clear pending notifications on your mobile phone.
+#
 # settings:
 # ---------
 # /set ircpushd_server (string)
@@ -56,6 +64,14 @@
 #   actual string it is trying to push.
 #   beware that this debug string will contain your auth-token!
 #
+# / set ircpush_clear_on_return_from_away (boolean)
+#    if set (default "off") will check for a server that returned from AWAY
+#    every 5 seconds and send a /ircpush_clear message if it detected such
+#    a return.
+#    this is intended to be used together with screen_away.pl, so that
+#    re-attaching to a screen will also clear pending notifications on your
+#    mobile.
+#
 #
 # network connections & security:
 # -------------------------------
@@ -76,8 +92,13 @@
 # version history:
 # ----------------
 #
+# 0.2, 2012-01-13
+#   * added /ircpush_clear command
+#   * added /set ircpush_clear_on_return_from_away setting
+#   * added checking for returning from AWAY state
+#
 # 0.1, 2012-01-12
-#   initial working version, SSL only, no cert-checks
+#   * initial working version, SSL only, no cert-checks
 #
 
 use strict;
@@ -86,7 +107,7 @@ use warnings;
 use IO::Socket::SSL;
 use Irssi;
 use Irssi::Irc;
-use vars qw($VERSION %IRSSI %config);
+use vars qw($VERSION %IRSSI %config $timer_name %away_memory);
 
 $VERSION = "0.2";
 
@@ -99,28 +120,33 @@ $VERSION = "0.2";
   url => "http://ircpush.dont-panic.cc/",
 );
 
-my %config;
+our %config;
+our $timer_name;
+our %away_memory;
 
 sub debug {
-  our %config;
   if ($config{debug}) {
     my $text = shift;
     my $caller = caller;
     if ($1) {
-      Irssi::print('From ' . $caller . ":\n" . $text);
+      Irssi::print('ircpush: from ' . $caller . ":\n" . $text);
     } else {
-      Irssi::print($text);
+      Irssi::print("ircpush: $text");
     }
   }
 }
 
 sub read_config {
-  our %config;
   $config{'server'} = Irssi::settings_get_str("ircpush_server");
   $config{'port'} = Irssi::settings_get_int("ircpush_port");
   $config{'authtoken'} = Irssi::settings_get_str("ircpush_auth_token");
   $config{'awayonly'} = Irssi::settings_get_bool("ircpush_away_only");
   $config{'debug'} = Irssi::settings_get_str("ircpush_debug");
+  $config{'clearonreturn'} = Irssi::settings_get_bool("ircpush_clear_on_return_from_away");
+
+  unregister_ircpush_away_timer() unless ($config{'clearonreturn'});
+  register_ircpush_away_timer() if ($config{'clearonreturn'});
+
   #debug("-------", 0);
   #debug("read_config:", 0);
   #foreach my $key (keys %config) {
@@ -139,7 +165,6 @@ sub escape {
 
 sub send_notify {
   my ($room, $sender, $message) = @_;
-  our %config;
   my $authtoken = $config{'authtoken'};
   my $server = $config{'server'};
   my $port = $config{'port'};
@@ -155,19 +180,27 @@ sub send_notify {
 
   return if $authtoken eq "";
   my $sock = IO::Socket::SSL->new("$server:$port");
-  $authtoken = escape($authtoken);
-  $message = escape($message);
-  $sender = escape($sender);
-  $room = escape ($room);
-  my $cmd = "{\"auth-token\":\"$authtoken\",\"message\":\"$message\",\"sender\":\"$sender\",\"badge\": 1,\"room\":\"$room\"}";
-  debug($cmd, 0);
-  print $sock $cmd;
-  $sock->close(SSL_ctx_free=>1);
+  if ($sock) {
+    $authtoken = escape($authtoken);
+    $message = escape($message);
+    $sender = escape($sender);
+    $room = escape ($room);
+    my $cmd = "{\"auth-token\":\"$authtoken\",\"message\":\"$message\",\"sender\":\"$sender\",\"badge\": 1,\"room\":\"$room\"}";
+    $cmd = "{\"auth-token\":\"$authtoken\",badge:0}" if ($room eq "" && $sender eq "" && $message eq "");
+    debug($cmd, 0);
+    if (print $sock $cmd) {
+      debug("Sent push successfully.");
+    } else {
+      debug("Failed sending push to server.", 0);
+    }
+    $sock->close(SSL_ctx_free=>1);
+  } else {
+    debug("Could not connect to push server.", 0);
+  }
 }
 
 sub msg_pub {
    my ($server, $data, $nick, $mask, $target) = @_;
-   our %config;
    if (($server->{usermode_away} || !$config{'awayonly'}) && $data =~ /$server->{nick}/i) {
      send_notify($target, $nick, $data);
    }
@@ -175,16 +208,49 @@ sub msg_pub {
 
 sub msg_priv {
    my ($server, $data, $nick, $address) = @_;
-   our %config;
    if ($server->{usermode_away} || !$config{'awayonly'}) {
      send_notify("", $nick, $data);
    }
+}
+
+sub msg_clear {
+  send_notify("", "", "");
+}
+
+sub check_away {
+  my $away;
+  my $someonereturned = 0;
+  foreach my $server (Irssi::servers()) {
+    my $was_away = $away_memory{$server->{'chatnet'}};
+    $someonereturned = 1 if ($was_away && !$server->{usermode_away});
+    $away_memory{$server->{'chatnet'}} = $server->{usermode_away};
+  }
+  if ($someonereturned) {
+    debug("At leat one server returned from AWAY.", 0);
+    msg_clear();
+  }
+}
+
+sub unregister_ircpush_away_timer {
+  if (defined($timer_name)) {
+    debug("Removing old timer...", 0);
+    # remove old timer, if defined
+    Irssi::timeout_remove($timer_name);
+  }
+}
+
+sub register_ircpush_away_timer {
+  unregister_ircpush_away_timer();
+  debug("Registering timer...", 0);  
+  # add new timer with new timeout (maybe the timeout has been changed)
+  $timer_name = Irssi::timeout_add(5 * 1000, 'check_away', '');
 }
 
 Irssi::settings_add_str("ircpush", "ircpush_server" => "localhost");
 Irssi::settings_add_int("ircpush", "ircpush_port" => 26144);
 Irssi::settings_add_str("ircpush", "ircpush_auth_token" => "");
 Irssi::settings_add_bool("ircpush", "ircpush_away_only" => 1);
+Irssi::settings_add_bool("ircpush", "ircpush_clear_on_return_from_away" => 0);
 Irssi::settings_add_bool("ircpush", "ircpush_debug" => 0);
 
 read_config();
@@ -193,3 +259,6 @@ Irssi::signal_add_last('setup changed', "read_config");
 Irssi::signal_add_last('message public', 'msg_pub');
 Irssi::signal_add_last('message private', 'msg_priv');
 
+Irssi::command_bind('ircpush_clear', 'msg_clear');
+
+register_ircpush_away_timer() if Irssi::settings_get_bool("ircpush_clear_on_return_from_away");
